@@ -201,7 +201,15 @@ async def get_global_settings():
         default_settings = {
             '_id': 'global_config',
             'free_user_ram_mb': config.User.FREE_USER_RAM_MB,
-            'require_approval': config.Bot.REQUIRE_APPROVAL
+            'require_approval': config.Bot.REQUIRE_APPROVAL,
+            # Force Subscribe settings
+            # force_public_channel: @username or -100xxx (public channel; bot can check membership)
+            # force_public_link: invite URL shown to user for the public channel
+            # force_private_link: invite URL for a private channel (bot cannot check membership,
+            #                     just shows a "Join" button — user self-verifies by pressing /start again)
+            'force_public_channel': '',
+            'force_public_link': '',
+            'force_private_link': '',
         }
         await settings_collection.insert_one(default_settings)
         return default_settings

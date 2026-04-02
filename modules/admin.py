@@ -24,7 +24,8 @@ from utils.database import (
 from utils.keyboard_helper import (
     admin_main_keyboard,
     admin_stats_keyboard,
-    admin_settings_keyboard,  # New import
+    admin_settings_keyboard,
+    admin_forcesub_keyboard,
     admin_user_management_keyboard,
     admin_user_detail_keyboard,
     admin_back_to_main_keyboard
@@ -137,21 +138,20 @@ async def admin_callback_router(client: Client, query: CallbackQuery):
         ram = settings.get('free_user_ram_mb', config.User.FREE_USER_RAM_MB)
         require_approval = settings.get('require_approval', config.Bot.REQUIRE_APPROVAL)
         await query.message.edit_text(
-            f"⚙️ **Global Settings**\n\nManage global configurations for all users.",
+            "⚙️ **Global Settings**\n\nManage global configurations for all users.",
             reply_markup=admin_settings_keyboard(ram, require_approval)
         )
+
     elif action == "setfreeram":
         try:
             ask_ram = await client.ask(query.from_user.id, "Enter the new RAM amount in MB for FREE users (e.g., `512`).", timeout=60)
             new_ram = int(ask_ram.text)
             if not (50 <= new_ram <= 1024):
                 raise ValueError("RAM must be between 50 and 1024 MB.")
-            
             await update_global_setting("free_user_ram_mb", new_ram)
             await query.answer(f"Free user RAM set to {new_ram} MB!", show_alert=True)
         except (ValueError, asyncio.TimeoutError) as e:
-            await query.message.reply_text(f"❌ Operation failed. Please provide a valid number. Error: {e}")
-        
+            await query.message.reply_text(f"❌ Operation failed: {e}")
         query.data = "admin_settings"
         await admin_callback_router(client, query)
 
@@ -161,8 +161,85 @@ async def admin_callback_router(client: Client, query: CallbackQuery):
         new_status = not current_status
         await update_global_setting("require_approval", new_status)
         await query.answer(f"Approval system {'enabled' if new_status else 'disabled'}!", show_alert=True)
-        
         query.data = "admin_settings"
+        await admin_callback_router(client, query)
+
+    # ── FORCE SUBSCRIBE SUB-MENU ──────────────────────────────────────────────
+    elif action == "forcesub":
+        settings = await get_global_settings()
+        pub_ch    = settings.get('force_public_channel', '').strip()
+        pub_link  = settings.get('force_public_link',    '').strip()
+        priv_link = settings.get('force_private_link',   '').strip()
+        await query.message.edit_text(
+            "📢 **Force Subscribe Settings**\n\n"
+            "**Force Public Channel** — The bot checks membership via the Telegram API.\n"
+            "Set the channel ID/username AND an invite link for the join button.\n\n"
+            "**Force Private Channel** — The bot cannot verify membership for private channels.\n"
+            "Only an invite link is needed; the user self-verifies by pressing /start again.",
+            reply_markup=admin_forcesub_keyboard(pub_ch, pub_link, priv_link)
+        )
+
+    elif action == "setfspubch":
+        try:
+            msg = await client.ask(
+                query.from_user.id,
+                "📢 Send the **Public Channel ID or @username** the bot should verify membership against.\n"
+                "Example: `@MyChannel` or `-1001234567890`",
+                timeout=60
+            )
+            val = msg.text.strip()
+            await update_global_setting("force_public_channel", val)
+            await query.answer(f"Public channel set to {val}!", show_alert=True)
+        except asyncio.TimeoutError:
+            await query.message.reply_text("⏰ Timed out.")
+        query.data = "admin_forcesub"
+        await admin_callback_router(client, query)
+
+    elif action == "setfspublink":
+        try:
+            msg = await client.ask(
+                query.from_user.id,
+                "🔗 Send the **Public Channel invite link** shown to users who haven't joined.\n"
+                "Example: `https://t.me/MyPublicChannel`",
+                timeout=60
+            )
+            val = msg.text.strip()
+            await update_global_setting("force_public_link", val)
+            await query.answer("Public channel invite link saved!", show_alert=True)
+        except asyncio.TimeoutError:
+            await query.message.reply_text("⏰ Timed out.")
+        query.data = "admin_forcesub"
+        await admin_callback_router(client, query)
+
+    elif action == "setfsprivlink":
+        try:
+            msg = await client.ask(
+                query.from_user.id,
+                "🔒 Send the **Private Channel invite link**.\n"
+                "Example: `https://t.me/+AbCdEfGhIjK`\n\n"
+                "⚠️ The bot cannot verify membership in private channels — "
+                "users are trusted after they click ✅ I've Joined.",
+                timeout=60
+            )
+            val = msg.text.strip()
+            await update_global_setting("force_private_link", val)
+            await query.answer("Private channel invite link saved!", show_alert=True)
+        except asyncio.TimeoutError:
+            await query.message.reply_text("⏰ Timed out.")
+        query.data = "admin_forcesub"
+        await admin_callback_router(client, query)
+
+    elif action == "clearfspub":
+        await update_global_setting("force_public_channel", "")
+        await update_global_setting("force_public_link", "")
+        await query.answer("✅ Public Force Sub cleared!", show_alert=True)
+        query.data = "admin_forcesub"
+        await admin_callback_router(client, query)
+
+    elif action == "clearfspriv":
+        await update_global_setting("force_private_link", "")
+        await query.answer("✅ Private Force Sub cleared!", show_alert=True)
+        query.data = "admin_forcesub"
         await admin_callback_router(client, query)
 
     elif action == "broadcast":

@@ -111,13 +111,54 @@ def admin_main_keyboard():
 
 def admin_settings_keyboard(current_ram: int, require_approval: bool):
     """Keyboard for the global settings section."""
-    approval_status = "✅ Enabled" if require_approval else "❌ Disabled"
+    approval_text = "✅ ON" if require_approval else "❌ OFF"
     buttons = [
-        [InlineKeyboardButton(f"🔧 Free RAM: {current_ram}MB", callback_data="admin_setfreeram")],
-        [InlineKeyboardButton(f"🛡️ Approval System: {approval_status}", callback_data="admin_toggleapproval")],
+        [InlineKeyboardButton(f"🔧 Free User RAM: {current_ram}MB", callback_data="admin_setfreeram")],
+        [InlineKeyboardButton(f"🛡️ Approval System: {approval_text}", callback_data="admin_toggleapproval")],
+        [InlineKeyboardButton("📢 Force Subscribe Settings", callback_data="admin_forcesub")],
         [InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_main")]
     ]
     return InlineKeyboardMarkup(buttons)
+
+
+def admin_forcesub_keyboard(pub_ch: str, pub_link: str, priv_link: str):
+    """Admin keyboard to manage Force Public & Force Private channel subscriptions."""
+    pub_ch_text   = f"🌐 Public CH: {pub_ch}"   if pub_ch   else "🌐 Set Public Channel"
+    pub_link_text = f"🔗 Public Link: Set"        if pub_link else "🔗 Set Public Invite Link"
+    priv_text     = f"🔒 Private Link: Set"       if priv_link else "🔒 Set Private Invite Link"
+
+    has_pub  = bool(pub_ch or pub_link)
+    has_priv = bool(priv_link)
+
+    buttons = [
+        # ── Public Channel ──────────────────────────────────
+        [InlineKeyboardButton("── 🌐 Force Public Channel ──", callback_data="noop")],
+        [InlineKeyboardButton(pub_ch_text,   callback_data="admin_setfspubch"),
+         InlineKeyboardButton(pub_link_text, callback_data="admin_setfspublink")],
+        [InlineKeyboardButton("🗑️ Clear Public", callback_data="admin_clearfspub")] if has_pub else
+         [InlineKeyboardButton("ℹ️ No public channel set", callback_data="noop")],
+        # ── Private Channel ─────────────────────────────────
+        [InlineKeyboardButton("── 🔒 Force Private Channel ──", callback_data="noop")],
+        [InlineKeyboardButton(priv_text, callback_data="admin_setfsprivlink")],
+        [InlineKeyboardButton("🗑️ Clear Private", callback_data="admin_clearfspriv")] if has_priv else
+         [InlineKeyboardButton("ℹ️ No private channel set", callback_data="noop")],
+        # ── Navigation ──────────────────────────────────────
+        [InlineKeyboardButton("⬅️ Back to Settings", callback_data="admin_settings")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def force_sub_required_keyboard(pub_link: str = None, priv_link: str = None):
+    """Keyboard shown to users who have not joined the required channel(s)."""
+    buttons = []
+    if pub_link:
+        buttons.append([InlineKeyboardButton("📢 Join Public Channel", url=pub_link)])
+    if priv_link:
+        buttons.append([InlineKeyboardButton("🔒 Join Private Channel", url=priv_link)])
+    # Let user retry after joining
+    buttons.append([InlineKeyboardButton("✅ I've Joined — Continue", callback_data="fsub_verify")])
+    return InlineKeyboardMarkup(buttons)
+
 
 def admin_back_to_main_keyboard(section: str = None):
     """A generic keyboard with a 'Back' button to the admin main menu."""
