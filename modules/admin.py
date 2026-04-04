@@ -1,63 +1,88 @@
-# modules/admin.py
-
 import asyncio
+
 from pyrogram import Client, filters
-from pyrogram.types import Message, CallbackQuery
-from pyrogram.errors import UserIsBlocked, FloodWait
+from pyrogram.errors import FloodWait
+from pyrogram.types import CallbackQuery, Message
 
 from config import config
 from utils.database import (
-    get_all_users,
-    get_all_projects_count,
-    get_all_premium_projects_count,
-    get_active_projects_count,
-    get_premium_users_count,  # New import
     find_user_by_id,
+    get_active_projects_count,
+    get_all_premium_projects_count,
+    get_all_projects_count,
+    get_all_users,
+    get_first_locked_project,
+    get_global_settings,
+    get_last_premium_project,
+    get_premium_users_count,
+    get_project_by_id,
     get_user_projects,
     increase_user_project_quota,
-    get_global_settings,
     update_global_setting,
-    get_last_premium_project, # New import
-    update_project_config,   # New import
-    get_first_locked_project
+    update_project_approval,
+    update_project_config,
 )
-from utils.keyboard_helper import (
-    admin_main_keyboard,
-    admin_stats_keyboard,
-    admin_settings_keyboard,
-    admin_forcesub_keyboard,
-    admin_user_management_keyboard,
-    admin_user_detail_keyboard,
-    admin_back_to_main_keyboard
-)
-# We need stop_project from the helper now
 from utils.deployment_helper import stop_project
+from utils.hosting_approval import get_project_approval_status
+from utils.keyboard_helper import (
+    admin_back_to_main_keyboard,
+    admin_forcesub_keyboard,
+    admin_main_keyboard,
+    admin_settings_keyboard,
+    admin_stats_keyboard,
+    admin_user_detail_keyboard,
+    admin_user_management_keyboard,
+)
+
 
 ADMIN_IDS = config.Bot.ADMIN_IDS
 
-# Dummy handler for no-op callbacks
+
 @Client.on_callback_query(filters.regex(r"^noop$"))
 async def noop_callback(client: Client, query: CallbackQuery):
     await query.answer()
 
+
 @Client.on_message(filters.command("admin") & filters.user(ADMIN_IDS))
 async def admin_panel(client: Client, message: Message):
     await message.reply_text(
-        "👑 **Admin Panel**\n\nWelcome. Please choose an option below.",
-        reply_markup=admin_main_keyboard()
+        "Admin Panel\n\nChoose an option below.",
+        reply_markup=admin_main_keyboard(),
     )
+
+
+async def _edit_review_message(message: Message, text: str):
+    try:
+        if message.document:
+            await message.edit_caption(caption=text, reply_markup=None)
+        else:
+            await message.edit_text(text, reply_markup=None)
+    except Exception:
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+def _project_summary(project: dict) -> str:
+    running = "RUN" if project.get("execution_info", {}).get("is_running") else "STOP"
+    tier = "PREM" if project.get("is_premium") else "FREE"
+    approval = get_project_approval_status(project).upper()
+    locked = " LOCKED" if project.get("is_locked") else ""
+    return f"- {project['name']} [{tier}] [{approval}] [{running}]{locked}"
+
 
 @Client.on_callback_query(filters.regex(r"^admin_"))
 async def admin_callback_router(client: Client, query: CallbackQuery):
     if query.from_user.id not in ADMIN_IDS:
-        return await query.answer("Access Denied.", show_alert=True)
-    
-    data = query.data.split('_')
+        return await query.answer("Access denied.", show_alert=True)
+
+    data = query.data.split("_")
     action = data[1]
 
-    # --- MAIN MENU & STATS ---
     if action == "main":
-        await query.message.edit_text("👑 **Admin Panel**\n\nWelcome.", reply_markup=admin_main_keyboard())
+        await query.message.edit_text("Admin Panel\n\nWelcome.", reply_markup=admin_main_keyboard())
+
     elif action == "stats":
         total_users = await get_all_users(count_only=True)
         premium_users = await get_premium_users_count()
@@ -65,133 +90,148 @@ async def admin_callback_router(client: Client, query: CallbackQuery):
         premium_projects = await get_all_premium_projects_count()
         active_projects = await get_active_projects_count()
         text = (
-            "📊 **Bot Statistics**\n\n"
-            f"👤 **Total Users:** `{total_users}`\n"
-            f"⭐ **Premium Users:** `{premium_users}`\n"
-            f"📁 **Total Projects:** `{total_projects}`\n"
-            f"💎 **Premium Projects:** `{premium_projects}`\n"
-            f"🟢 **Active (Running) Projects:** `{active_projects}`"
+            "**Bot Statistics**\n\n"
+            f"Total Users: `{total_users}`\n"
+            f"Premium Users: `{premium_users}`\n"
+            f"Total Projects: `{total_projects}`\n"
+            f"Premium Projects: `{premium_projects}`\n"
+            f"Active Projects: `{active_projects}`"
         )
         await query.message.edit_text(text, reply_markup=admin_stats_keyboard())
 
-    # --- USER MANAGEMENT ---
     elif action == "users":
-        await query.message.edit_text("👤 **User Management**\n\nEnter a user's Telegram ID to manage them.", reply_markup=admin_user_management_keyboard())
+        await query.message.edit_text(
+            "User Management\n\nSend a user's Telegram ID to inspect their account.",
+            reply_markup=admin_user_management_keyboard(),
+        )
+
     elif action == "finduser":
         try:
-            ask_msg = await client.ask(query.from_user.id, "Please send the User ID.", timeout=60)
+            ask_msg = await client.ask(query.from_user.id, "Send the user ID.", timeout=60)
             await _show_user_details(client, query, int(ask_msg.text))
         except ValueError:
-            await query.message.reply_text("❌ Invalid ID.")
+            await query.message.reply_text("Invalid ID.")
         except asyncio.TimeoutError:
-            await query.message.reply_text("⏰ Timed out.")
+            await query.message.reply_text("Timed out.")
+
     elif action == "viewuser":
         await _show_user_details(client, query, int(data[2]))
-    
-    # --- QUOTA MANAGEMENT (REVISED) ---
+
     elif action == "changequota":
         mod_type = data[2]
         user_id = int(data[3])
         user = await find_user_by_id(user_id)
-        current_quota = user.get('project_quota', config.User.FREE_USER_PROJECT_QUOTA)
+        current_quota = user.get("project_quota", config.User.FREE_USER_PROJECT_QUOTA)
 
-        if mod_type == 'add':
+        if mod_type == "add":
             new_quota = await increase_user_project_quota(user_id, 1)
-            
-            # --- NEW LOGIC: Try to unlock a project ---
             project_to_unlock = await get_first_locked_project(user_id)
             if project_to_unlock:
                 from datetime import datetime, timedelta
-                project_id_str = str(project_to_unlock['_id'])
-                # Give it a new 30-day lease on life
-                new_expiry = datetime.utcnow() + timedelta(days=30)
-                await update_project_config(project_id_str, {'is_locked': False, 'expiry_date': new_expiry})
-                
-                await query.answer(f"Quota added! Project '{project_to_unlock['name']}' has been UNLOCKED for 30 days.", show_alert=True)
-                await client.send_message(user_id, f"✅ An admin has adjusted your quota. Your project `{project_to_unlock['name']}` has been unlocked!")
-            else:
-                await query.answer(f"Quota increased to {new_quota}! No locked projects to unlock.", show_alert=True)
 
-        elif mod_type == 'remove':
+                project_id_str = str(project_to_unlock["_id"])
+                new_expiry = datetime.utcnow() + timedelta(days=30)
+                await update_project_config(
+                    project_id_str,
+                    {"is_locked": False, "expiry_date": new_expiry},
+                )
+                await query.answer(
+                    f"Quota added. Project '{project_to_unlock['name']}' unlocked for 30 days.",
+                    show_alert=True,
+                )
+                await client.send_message(
+                    user_id,
+                    f"An admin adjusted your quota. Project `{project_to_unlock['name']}` was unlocked.",
+                )
+            else:
+                await query.answer(f"Quota increased to {new_quota}.", show_alert=True)
+
+        elif mod_type == "remove":
             if current_quota <= config.User.FREE_USER_PROJECT_QUOTA:
-                return await query.answer("Cannot reduce quota below the free tier limit.", show_alert=True)
-            
-            # Reduce quota in DB
+                return await query.answer(
+                    "Cannot reduce quota below the free tier limit.",
+                    show_alert=True,
+                )
+
             new_quota = await increase_user_project_quota(user_id, -1)
-            
-            # Find and lock the most recent premium project
             project_to_lock = await get_last_premium_project(user_id)
             if project_to_lock:
-                project_id_str = str(project_to_lock['_id'])
+                project_id_str = str(project_to_lock["_id"])
                 await stop_project(project_id_str)
-                await update_project_config(project_id_str, {'is_locked': True})
-                await query.answer(f"Quota reduced! Project '{project_to_lock['name']}' has been locked.", show_alert=True)
-                await client.send_message(user_id, f"🔒 An admin has adjusted your quota. Your project `{project_to_lock['name']}` is now locked.")
+                await update_project_config(project_id_str, {"is_locked": True})
+                await query.answer(
+                    f"Quota reduced. Project '{project_to_lock['name']}' was locked.",
+                    show_alert=True,
+                )
+                await client.send_message(
+                    user_id,
+                    f"An admin adjusted your quota. Project `{project_to_lock['name']}` is now locked.",
+                )
             else:
-                await query.answer(f"Quota reduced to {new_quota}! No active premium project was found to lock.", show_alert=True)
-        
-        await _show_user_details(client, query, user_id) # Refresh the user view
+                await query.answer(f"Quota reduced to {new_quota}.", show_alert=True)
 
-    # --- GLOBAL SETTINGS & BROADCAST ---
+        await _show_user_details(client, query, user_id)
+
     elif action == "settings":
         settings = await get_global_settings()
-        ram = settings.get('free_user_ram_mb', config.User.FREE_USER_RAM_MB)
-        require_approval = settings.get('require_approval', config.Bot.REQUIRE_APPROVAL)
+        ram = settings.get("free_user_ram_mb", config.User.FREE_USER_RAM_MB)
+        require_approval = settings.get("require_approval", config.Bot.REQUIRE_APPROVAL)
         await query.message.edit_text(
-            "⚙️ **Global Settings**\n\nManage global configurations for all users.",
-            reply_markup=admin_settings_keyboard(ram, require_approval)
+            "Global Settings\n\nManage bot-wide configuration here.",
+            reply_markup=admin_settings_keyboard(ram, require_approval),
         )
 
     elif action == "setfreeram":
         try:
-            ask_ram = await client.ask(query.from_user.id, "Enter the new RAM amount in MB for FREE users (e.g., `512`).", timeout=60)
+            ask_ram = await client.ask(
+                query.from_user.id,
+                "Enter the new RAM amount in MB for free users.",
+                timeout=60,
+            )
             new_ram = int(ask_ram.text)
             if not (50 <= new_ram <= 1024):
                 raise ValueError("RAM must be between 50 and 1024 MB.")
             await update_global_setting("free_user_ram_mb", new_ram)
-            await query.answer(f"Free user RAM set to {new_ram} MB!", show_alert=True)
-        except (ValueError, asyncio.TimeoutError) as e:
-            await query.message.reply_text(f"❌ Operation failed: {e}")
+            await query.answer(f"Free user RAM set to {new_ram} MB.", show_alert=True)
+        except (ValueError, asyncio.TimeoutError) as error:
+            await query.message.reply_text(f"Operation failed: {error}")
         query.data = "admin_settings"
         await admin_callback_router(client, query)
 
     elif action == "toggleapproval":
         settings = await get_global_settings()
-        current_status = settings.get('require_approval', config.Bot.REQUIRE_APPROVAL)
+        current_status = settings.get("require_approval", config.Bot.REQUIRE_APPROVAL)
         new_status = not current_status
         await update_global_setting("require_approval", new_status)
-        await query.answer(f"Approval system {'enabled' if new_status else 'disabled'}!", show_alert=True)
+        await query.answer(
+            f"Hosting approval {'enabled' if new_status else 'disabled'}.",
+            show_alert=True,
+        )
         query.data = "admin_settings"
         await admin_callback_router(client, query)
 
-    # ── FORCE SUBSCRIBE SUB-MENU ──────────────────────────────────────────────
     elif action == "forcesub":
         settings = await get_global_settings()
-        pub_ch    = settings.get('force_public_channel', '').strip()
-        pub_link  = settings.get('force_public_link',    '').strip()
-        priv_link = settings.get('force_private_link',   '').strip()
+        pub_ch = settings.get("force_public_channel", "").strip()
+        pub_link = settings.get("force_public_link", "").strip()
+        priv_link = settings.get("force_private_link", "").strip()
         await query.message.edit_text(
-            "📢 **Force Subscribe Settings**\n\n"
-            "**Force Public Channel** — The bot checks membership via the Telegram API.\n"
-            "Set the channel ID/username AND an invite link for the join button.\n\n"
-            "**Force Private Channel** — The bot cannot verify membership for private channels.\n"
-            "Only an invite link is needed; the user self-verifies by pressing /start again.",
-            reply_markup=admin_forcesub_keyboard(pub_ch, pub_link, priv_link)
+            "Force Subscribe Settings\n\n"
+            "Public channels can be verified by the bot. Private channels only show an invite link.",
+            reply_markup=admin_forcesub_keyboard(pub_ch, pub_link, priv_link),
         )
 
     elif action == "setfspubch":
         try:
             msg = await client.ask(
                 query.from_user.id,
-                "📢 Send the **Public Channel ID or @username** the bot should verify membership against.\n"
-                "Example: `@MyChannel` or `-1001234567890`",
-                timeout=60
+                "Send the public channel ID or @username to verify.",
+                timeout=60,
             )
-            val = msg.text.strip()
-            await update_global_setting("force_public_channel", val)
-            await query.answer(f"Public channel set to {val}!", show_alert=True)
+            await update_global_setting("force_public_channel", msg.text.strip())
+            await query.answer("Public channel saved.", show_alert=True)
         except asyncio.TimeoutError:
-            await query.message.reply_text("⏰ Timed out.")
+            await query.message.reply_text("Timed out.")
         query.data = "admin_forcesub"
         await admin_callback_router(client, query)
 
@@ -199,15 +239,13 @@ async def admin_callback_router(client: Client, query: CallbackQuery):
         try:
             msg = await client.ask(
                 query.from_user.id,
-                "🔗 Send the **Public Channel invite link** shown to users who haven't joined.\n"
-                "Example: `https://t.me/MyPublicChannel`",
-                timeout=60
+                "Send the public invite link users should open.",
+                timeout=60,
             )
-            val = msg.text.strip()
-            await update_global_setting("force_public_link", val)
-            await query.answer("Public channel invite link saved!", show_alert=True)
+            await update_global_setting("force_public_link", msg.text.strip())
+            await query.answer("Public invite link saved.", show_alert=True)
         except asyncio.TimeoutError:
-            await query.message.reply_text("⏰ Timed out.")
+            await query.message.reply_text("Timed out.")
         query.data = "admin_forcesub"
         await admin_callback_router(client, query)
 
@@ -215,118 +253,165 @@ async def admin_callback_router(client: Client, query: CallbackQuery):
         try:
             msg = await client.ask(
                 query.from_user.id,
-                "🔒 Send the **Private Channel invite link**.\n"
-                "Example: `https://t.me/+AbCdEfGhIjK`\n\n"
-                "⚠️ The bot cannot verify membership in private channels — "
-                "users are trusted after they click ✅ I've Joined.",
-                timeout=60
+                "Send the private invite link.",
+                timeout=60,
             )
-            val = msg.text.strip()
-            await update_global_setting("force_private_link", val)
-            await query.answer("Private channel invite link saved!", show_alert=True)
+            await update_global_setting("force_private_link", msg.text.strip())
+            await query.answer("Private invite link saved.", show_alert=True)
         except asyncio.TimeoutError:
-            await query.message.reply_text("⏰ Timed out.")
+            await query.message.reply_text("Timed out.")
         query.data = "admin_forcesub"
         await admin_callback_router(client, query)
 
     elif action == "clearfspub":
         await update_global_setting("force_public_channel", "")
         await update_global_setting("force_public_link", "")
-        await query.answer("✅ Public Force Sub cleared!", show_alert=True)
+        await query.answer("Public force-sub cleared.", show_alert=True)
         query.data = "admin_forcesub"
         await admin_callback_router(client, query)
 
     elif action == "clearfspriv":
         await update_global_setting("force_private_link", "")
-        await query.answer("✅ Private Force Sub cleared!", show_alert=True)
+        await query.answer("Private force-sub cleared.", show_alert=True)
         query.data = "admin_forcesub"
         await admin_callback_router(client, query)
 
     elif action == "broadcast":
         try:
-            prompt = await client.ask(query.from_user.id, "➡️ Send message to broadcast or /cancel.", timeout=300)
+            prompt = await client.ask(
+                query.from_user.id,
+                "Send the message to broadcast or /cancel.",
+                timeout=300,
+            )
             if prompt.text == "/cancel":
-                return await prompt.reply_text("Broadcast cancelled.", reply_markup=admin_main_keyboard())
-            
-            confirm = await client.ask(query.from_user.id, "Send `yes` to confirm broadcast.", timeout=60)
-            if confirm.text.lower() != 'yes':
-                return await confirm.reply_text("Broadcast cancelled.", reply_markup=admin_main_keyboard())
-            
+                return await prompt.reply_text(
+                    "Broadcast cancelled.",
+                    reply_markup=admin_main_keyboard(),
+                )
+
+            confirm = await client.ask(
+                query.from_user.id,
+                "Send `yes` to confirm the broadcast.",
+                timeout=60,
+            )
+            if confirm.text.lower() != "yes":
+                return await confirm.reply_text(
+                    "Broadcast cancelled.",
+                    reply_markup=admin_main_keyboard(),
+                )
+
             await _run_broadcast(client, query, prompt)
         except asyncio.TimeoutError:
-            await query.message.reply_text("⏰ Timed out. Broadcast cancelled.", reply_markup=admin_main_keyboard())
+            await query.message.reply_text(
+                "Timed out. Broadcast cancelled.",
+                reply_markup=admin_main_keyboard(),
+            )
 
-    # --- APPROVAL MANAGEMENT ---
-    elif action == "approve":
-        target_user_id = int(data[2])
-        from utils.database import update_user_approval
-        await update_user_approval(target_user_id, True)
-        await query.message.edit_text(f"✅ User `{target_user_id}` has been approved.")
+    elif action == "hostapprove":
+        project_id = data[2]
+        project = await get_project_by_id(project_id)
+        if not project:
+            return await query.answer("Project not found.", show_alert=True)
+
+        await update_project_approval(project_id, "approved", reviewed_by=query.from_user.id)
+        await _edit_review_message(
+            query.message,
+            f"Hosting approved for project `{project['name']}` ({project_id}).",
+        )
         try:
-            await client.send_message(target_user_id, "🎉 **Congratulations!** Your account has been approved by an administrator. You can now use all the bot's features!")
+            await client.send_message(
+                project["user_id"],
+                f"Your project `{project['name']}` has been approved for hosting. You can deploy it now.",
+            )
         except Exception:
             pass
-    elif action == "reject":
-        target_user_id = int(data[2])
-        await query.message.edit_text(f"❌ User `{target_user_id}` has been rejected.")
+
+    elif action == "hostreject":
+        project_id = data[2]
+        project = await get_project_by_id(project_id)
+        if not project:
+            return await query.answer("Project not found.", show_alert=True)
+
+        await stop_project(project_id)
+        await update_project_approval(
+            project_id,
+            "rejected",
+            reason="Rejected by an admin.",
+        )
+        await _edit_review_message(
+            query.message,
+            f"Hosting rejected for project `{project['name']}` ({project_id}).",
+        )
         try:
-            await client.send_message(target_user_id, "🚫 **Sorry!** Your request for approval has been rejected by an administrator.")
+            await client.send_message(
+                project["user_id"],
+                f"Your project `{project['name']}` was rejected for hosting. "
+                "Update it and send it for approval again.",
+            )
         except Exception:
             pass
+
+    elif action in {"approve", "reject"}:
+        await _edit_review_message(
+            query.message,
+            "User approval has been removed. Hosting approval is now project-based.",
+        )
 
     await query.answer()
 
+
 async def _show_user_details(client: Client, query: CallbackQuery, user_id: int):
-    """Helper function to display a detailed view of a user (Revised)."""
     user = await find_user_by_id(user_id)
     if not user:
-        return await query.message.edit_text(f"❌ User `{user_id}` not found.", reply_markup=admin_user_management_keyboard())
+        return await query.message.edit_text(
+            f"User `{user_id}` not found.",
+            reply_markup=admin_user_management_keyboard(),
+        )
 
     projects = await get_user_projects(user_id)
-    project_list_str = "\n".join(
-        f"- `{p['name']}` {'🟢' if p.get('execution_info',{}).get('is_running') else '🔴'}{'⭐' if p.get('is_premium') else '🆓'}{'🔒' if p.get('is_locked') else ''}"
-        for p in projects
-    ) or "No projects found."
+    project_list = "\n".join(_project_summary(project) for project in projects) or "No projects found."
 
-    current_quota = user.get('project_quota', config.User.FREE_USER_PROJECT_QUOTA)
-    is_approved = user.get('is_approved', False)
+    current_quota = user.get("project_quota", config.User.FREE_USER_PROJECT_QUOTA)
+    joined_at = user.get("joined_at")
+    joined_str = joined_at.strftime("%Y-%m-%d") if joined_at else "N/A"
 
     text = (
-        f"👤 **User Details: `{user_id}`**\n\n"
-        f"**Username:** `@{user.get('username', 'N/A')}`\n"
-        f"**Status:** {'✅ Approved' if is_approved else '⏳ Pending/Unapproved'}\n"
-        f"**Joined:** `{user.get('joined_at', 'N/A').strftime('%Y-%m-%d')}`\n\n"
-        f"**Projects:**\n{project_list_str}"
+        f"**User Details: `{user_id}`**\n\n"
+        f"Username: `@{user.get('username', 'N/A')}`\n"
+        f"Joined: `{joined_str}`\n"
+        f"Project Quota: `{current_quota}`\n\n"
+        f"Projects:\n{project_list}"
     )
-    
-    await query.message.edit_text(text, reply_markup=admin_user_detail_keyboard(user_id, current_quota, is_approved))
+
+    await query.message.edit_text(
+        text,
+        reply_markup=admin_user_detail_keyboard(user_id, current_quota, True),
+    )
 
 
 async def _run_broadcast(client: Client, query: CallbackQuery, broadcast_msg: Message):
-    # (Your broadcast logic can stay the same, I'm just including it for the file to be complete)
     users = await get_all_users()
     total_users = len(users)
-    status_msg = await query.message.edit_text(f"📢 Starting broadcast to `{total_users}` users...")
+    status_msg = await query.message.edit_text(f"Starting broadcast to `{total_users}` users...")
 
-    sent, failed = 0, 0
+    sent = 0
+    failed = 0
     start_time = asyncio.get_event_loop().time()
 
     for user in users:
         try:
-            await broadcast_msg.copy(user['_id'])
+            await broadcast_msg.copy(user["_id"])
             sent += 1
             await asyncio.sleep(0.05)
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            await broadcast_msg.copy(user['_id'])
+        except FloodWait as error:
+            await asyncio.sleep(error.value)
+            await broadcast_msg.copy(user["_id"])
             sent += 1
         except Exception:
             failed += 1
-        
+
     elapsed = int(asyncio.get_event_loop().time() - start_time)
     await status_msg.edit_text(
-        f"✅ **Broadcast Complete**\n\n"
-        f"Sent: `{sent}`\nFailed: `{failed}`\n"
-        f"Total time: `{elapsed}`s.",
-        reply_markup=admin_back_to_main_keyboard()
+        f"Broadcast complete.\n\nSent: `{sent}`\nFailed: `{failed}`\nTime: `{elapsed}`s.",
+        reply_markup=admin_back_to_main_keyboard(),
     )
