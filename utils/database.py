@@ -1,8 +1,9 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import motor.motor_asyncio
 from bson import ObjectId
+from pymongo import ReturnDocument
 
 from config import config
 
@@ -13,23 +14,52 @@ db = client[config.Bot.MONGO_DB_NAME]
 users_collection = db["users"]
 projects_collection = db["projects"]
 settings_collection = db["bot_settings"]
+keys_collection = db["redeem_keys"]
+
+
+def _default_premium_ram() -> int:
+    return config.Premium.PLANS.get("1", {}).get("ram_mb", config.User.DEFAULT_PREMIUM_RAM_MB)
 
 
 async def add_user(user_id: int, username: str | None):
-    """
-    Create or refresh a user document.
-
-    The legacy is_approved field is kept truthy so old data paths do not lock users out.
-    Hosting approval now happens per project instead.
-    """
     await users_collection.update_one(
         {"_id": user_id},
         {
-            "$set": {"username": username, "is_approved": True},
+            "$set": {
+                "username": username,
+                "is_approved": True,
+            },
             "$setOnInsert": {
                 "joined_at": datetime.utcnow(),
                 "project_quota": config.User.FREE_USER_PROJECT_QUOTA,
+                "premium_slot_ram_mb": _default_premium_ram(),
+                "keys_redeemed": 0,
+                "is_banned": False,
+                "ban_reason": None,
+                "banned_at": None,
+                "banned_by": None,
             },
+        },
+        upsert=True,
+    )
+
+
+async def ensure_user_exists(user_id: int, username: str | None = None):
+    await users_collection.update_one(
+        {"_id": user_id},
+        {
+            "$setOnInsert": {
+                "joined_at": datetime.utcnow(),
+                "project_quota": config.User.FREE_USER_PROJECT_QUOTA,
+                "premium_slot_ram_mb": _default_premium_ram(),
+                "keys_redeemed": 0,
+                "is_banned": False,
+                "ban_reason": None,
+                "banned_at": None,
+                "banned_by": None,
+                "is_approved": True,
+                "username": username,
+            }
         },
         upsert=True,
     )
@@ -46,19 +76,62 @@ async def find_user_by_id(user_id: int):
     return await users_collection.find_one({"_id": user_id})
 
 
+async def set_user_ban_status(
+    user_id: int,
+    is_banned: bool,
+    banned_by: int | None = None,
+    reason: str | None = None,
+):
+    await ensure_user_exists(user_id)
+    update_fields = {
+        "is_banned": is_banned,
+        "ban_reason": reason if is_banned else None,
+        "banned_at": datetime.utcnow() if is_banned else None,
+        "banned_by": banned_by if is_banned else None,
+    }
+    await users_collection.update_one({"_id": user_id}, {"$set": update_fields})
+
+
 async def increase_user_project_quota(user_id: int, amount: int = 1):
+    await ensure_user_exists(user_id)
     result = await users_collection.find_one_and_update(
         {"_id": user_id},
         {"$inc": {"project_quota": amount}},
-        return_document=True,
+        return_document=ReturnDocument.AFTER,
     )
     return result.get("project_quota", config.User.FREE_USER_PROJECT_QUOTA)
+
+
+async def set_user_premium_ram(user_id: int, ram_mb: int):
+    await ensure_user_exists(user_id)
+    await users_collection.update_one(
+        {"_id": user_id},
+        {"$set": {"premium_slot_ram_mb": ram_mb}},
+    )
 
 
 async def get_all_users(count_only: bool = False):
     if count_only:
         return await users_collection.count_documents({})
-    return await users_collection.find({}).to_list(None)
+    return await users_collection.find({}).sort("joined_at", -1).to_list(None)
+
+
+async def get_users_page(page: int = 0, page_size: int | None = None):
+    page_size = page_size or config.Bot.USERS_PAGE_SIZE
+    page = max(page, 0)
+    cursor = (
+        users_collection.find({})
+        .sort("joined_at", -1)
+        .skip(page * page_size)
+        .limit(page_size)
+    )
+    users = await cursor.to_list(page_size)
+    total = await users_collection.count_documents({})
+    return users, total
+
+
+async def get_banned_users_count():
+    return await users_collection.count_documents({"is_banned": True})
 
 
 async def add_project(
@@ -163,22 +236,14 @@ async def delete_project(project_id: str):
 
 async def get_last_premium_project(user_id: int):
     return await projects_collection.find_one(
-        {
-            "user_id": user_id,
-            "is_premium": True,
-            "is_locked": False,
-        },
+        {"user_id": user_id, "is_premium": True, "is_locked": False},
         sort=[("created_at", -1)],
     )
 
 
 async def get_first_locked_project(user_id: int):
     return await projects_collection.find_one(
-        {
-            "user_id": user_id,
-            "is_premium": True,
-            "is_locked": True,
-        },
+        {"user_id": user_id, "is_premium": True, "is_locked": True},
         sort=[("created_at", -1)],
     )
 
@@ -201,6 +266,89 @@ async def get_premium_users_count():
     )
 
 
+async def create_redeem_key(
+    code: str,
+    slots: int,
+    ram_mb: int,
+    created_by: int,
+    valid_days: int | None = None,
+):
+    expires_at = None
+    if valid_days and valid_days > 0:
+        expires_at = datetime.utcnow() + timedelta(days=valid_days)
+
+    key_doc = {
+        "code": code.upper(),
+        "slots": slots,
+        "ram_mb": ram_mb,
+        "created_by": created_by,
+        "created_at": datetime.utcnow(),
+        "expires_at": expires_at,
+        "status": "active",
+        "redeemed_by": None,
+        "redeemed_at": None,
+    }
+    await keys_collection.insert_one(key_doc)
+    return key_doc
+
+
+async def get_key_by_code(code: str):
+    return await keys_collection.find_one({"code": code.upper().strip()})
+
+
+async def get_recent_keys(limit: int = 10):
+    return await keys_collection.find({}).sort("created_at", -1).limit(limit).to_list(limit)
+
+
+async def redeem_key(code: str, user_id: int, username: str | None = None):
+    key = await get_key_by_code(code)
+    if not key:
+        return False, "Invalid key.", None
+
+    if key.get("status") != "active":
+        return False, "This key is already used or inactive.", key
+
+    expires_at = key.get("expires_at")
+    if expires_at and expires_at < datetime.utcnow():
+        await keys_collection.update_one(
+            {"_id": key["_id"]},
+            {"$set": {"status": "expired"}},
+        )
+        return False, "This key has expired.", key
+
+    await ensure_user_exists(user_id, username=username)
+    update_result = await keys_collection.find_one_and_update(
+        {"_id": key["_id"], "status": "active"},
+        {
+            "$set": {
+                "status": "redeemed",
+                "redeemed_by": user_id,
+                "redeemed_at": datetime.utcnow(),
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if not update_result:
+        return False, "This key was just redeemed by someone else.", key
+
+    await users_collection.update_one(
+        {"_id": user_id},
+        {
+            "$inc": {
+                "project_quota": key.get("slots", 0),
+                "keys_redeemed": 1,
+            },
+            "$max": {
+                "premium_slot_ram_mb": key.get("ram_mb", _default_premium_ram()),
+            },
+            "$set": {
+                "username": username,
+            },
+        },
+    )
+    return True, "Key redeemed successfully.", update_result
+
+
 async def get_global_settings():
     settings = await settings_collection.find_one({"_id": "global_config"})
     if settings:
@@ -209,8 +357,9 @@ async def get_global_settings():
     default_settings = {
         "_id": "global_config",
         "free_user_ram_mb": config.User.FREE_USER_RAM_MB,
-        # This now means hosting approval for projects before deployment.
         "require_approval": config.Bot.REQUIRE_APPROVAL,
+        "maintenance_mode": False,
+        "maintenance_reason": "Upgrading services",
         "force_public_channel": "",
         "force_public_link": "",
         "force_private_link": "",
